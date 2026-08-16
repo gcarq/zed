@@ -506,9 +506,10 @@ impl LlamaCppLanguageModelProvider {
                 }
             }),
         };
-        // Discover eagerly so a running server is picked up without opening settings.
+        // Load any stored API key before eagerly discovering models.
         this.state
-            .update(cx, |state, cx| state.restart_fetch_models_task(cx));
+            .update(cx, |state, cx| state.authenticate(cx))
+            .detach();
         this
     }
 
@@ -1639,7 +1640,6 @@ mod tests {
     use gpui::TestAppContext;
     use http_client::FakeHttpClient;
     use parking_lot::Mutex;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct FakeCredentialsProvider {
         api_key: Vec<u8>,
@@ -2049,20 +2049,17 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn authenticate_fetches_models_after_loading_api_key(cx: &mut TestAppContext) {
+    async fn eager_discovery_waits_for_api_key(cx: &mut TestAppContext) {
         cx.update(|cx| {
             let settings_store = SettingsStore::test(cx);
             cx.set_global(settings_store);
         });
 
         let model_request_authorizations = Arc::new(Mutex::new(Vec::new()));
-        let model_request_count = Arc::new(AtomicUsize::new(0));
         let http_client = FakeHttpClient::create({
             let model_request_authorizations = model_request_authorizations.clone();
-            let model_request_count = model_request_count.clone();
             move |request| {
                 let model_request_authorizations = model_request_authorizations.clone();
-                let model_request_count = model_request_count.clone();
                 async move {
                     let path = request.uri().path();
                     let authorization = request
@@ -2073,12 +2070,6 @@ mod tests {
 
                     if path == "/v1/models" {
                         model_request_authorizations.lock().push(authorization);
-                        let request_index = model_request_count.fetch_add(1, Ordering::SeqCst);
-                        if request_index == 0 {
-                            return Ok(http_client::Response::builder()
-                                .status(503)
-                                .body(http_client::AsyncBody::from("not ready"))?);
-                        }
 
                         return Ok(http_client::Response::builder().status(200).body(
                             http_client::AsyncBody::from(
@@ -2107,14 +2098,11 @@ mod tests {
 
         cx.run_until_parked();
 
-        let result = cx.update(|cx| provider.authenticate(cx)).await;
-        assert!(
-            result.is_ok(),
-            "authenticate should discover models after loading credentials"
-        );
         assert_eq!(
             &*model_request_authorizations.lock(),
-            &[None, Some("Bearer loaded-key".to_string())]
+            &[Some("Bearer loaded-key".to_string())]
         );
+
+        drop(provider);
     }
 }
